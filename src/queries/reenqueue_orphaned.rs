@@ -31,7 +31,8 @@ fn effective_reenqueue_millis(config: &Config) -> i64 {
     after.as_millis() as i64
 }
 
-/// Return tasks held by timed-out workers to the queue and report how many
+/// Return tasks held by timed-out workers to the queue, killing those out of attempts, and report
+/// how many were re-enqueued
 pub async fn reenqueue_orphaned(
     conn: &Arc<Surreal<Any>>,
     config: &Config,
@@ -42,7 +43,14 @@ pub async fn reenqueue_orphaned(
         .bind(("queue", config.queue().to_string()))
         .bind(("dur", dead_for))
         .await?;
-    let reenqueued: Vec<Value> = response.take(1)?;
+    let killed: Vec<Value> = response.take(4)?;
+    let reenqueued: Vec<Value> = response.take(5)?;
+    if !killed.is_empty() {
+        log::warn!(
+            "Killed {} orphaned tasks that had no attempts left",
+            killed.len()
+        );
+    }
     let count = reenqueued.len() as u64;
     if count > 0 {
         log::info!("Re-enqueued {count} orphaned tasks that were being processed by dead workers");
