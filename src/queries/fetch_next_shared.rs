@@ -4,7 +4,8 @@ use crate::{
     CompactType, SurrealError, SurrealTask,
     from_row::SurrealTaskRow,
     queries::{
-        MAX_TX_RETRIES, TxOutcome, classify_tx_errors, fetch_next::decode_row, kill_task::kill_task,
+        MAX_TX_RETRIES, TxOutcome, classify_tx_errors, fetch_next::decode_row,
+        kill_task::kill_task, tx_unavailable_backoff,
     },
 };
 
@@ -19,8 +20,8 @@ pub async fn fetch_next_shared(
     queues: &[String],
     limit: i64,
 ) -> Result<Vec<SurrealTask<CompactType>>, SurrealError> {
-    let mut conflict = None;
-    for _ in 0..MAX_TX_RETRIES {
+    let mut last_err = None;
+    for attempt in 0..MAX_TX_RETRIES {
         let mut response = conn
             .query(FETCH_NEXT_SHARED)
             .bind(("queues", queues.to_vec()))
@@ -28,7 +29,12 @@ pub async fn fetch_next_shared(
             .await?;
         match classify_tx_errors(response.take_errors()) {
             Some(TxOutcome::Retry(err)) => {
-                conflict = Some(err);
+                last_err = Some(err);
+                continue;
+            }
+            Some(TxOutcome::Unavailable(err)) => {
+                last_err = Some(err);
+                tx_unavailable_backoff("fetch_next_shared", attempt).await;
                 continue;
             }
             Some(TxOutcome::Fail(err)) => return Err(SurrealError::Database(err)),
@@ -51,8 +57,8 @@ pub async fn fetch_next_shared(
         }
         return Ok(tasks);
     }
-    // surface the conflict after exhausting retries instead of faking an empty batch
-    Err(SurrealError::Database(conflict.unwrap_or_else(|| {
+    // surface the failure after exhausting retries instead of faking an empty batch
+    Err(SurrealError::Database(last_err.unwrap_or_else(|| {
         surrealdb::Error::query(
             "Transaction conflict retries exhausted".to_owned(),
             surrealdb::types::QueryError::TransactionConflict,
