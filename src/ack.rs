@@ -49,8 +49,23 @@ impl<Res: Serialize + 'static> Acknowledge<Res, SurrealContext, Ulid> for Surrea
         async move {
             let task_id = task_id.ok_or(SurrealError::MissingTaskId)?;
             let worker = worker.ok_or(SurrealError::MissingWorkerContext)?;
-            let result = result.map_err(|e| SurrealError::Decode(e.into()))?;
-            ack_task(&conn, &task_id, &worker, result, &status, attempt).await?;
+            let result = match result {
+                Ok(value) => value,
+                Err(e) => {
+                    log::error!(
+                        "Could not serialise the result of task {task_id}: {e}. Recording a placeholder error so the task still reaches a terminal state."
+                    );
+                    serde_json::json!({ "Err": format!("<result could not be serialised: {e}>") })
+                }
+            };
+            if let Err(e) = ack_task(&conn, &task_id, &worker, result, &status, attempt).await {
+                if matches!(e, SurrealError::TaskNotFound(_)) {
+                    log::error!(
+                        "Discarded the result of task {task_id} (status {status}): the `lock_by = {worker}` guard did not match, so instance {worker} lost the lock while running. The task now belongs to another worker and will be, or already has been, re-run there."
+                    );
+                }
+                return Err(e);
+            }
             Ok(())
         }
         .boxed()
@@ -117,8 +132,16 @@ where
         req.parts.ctx = req.parts.ctx.with_lock_by(Some(worker.clone()));
         let fut = self.inner.call(req);
         async move {
-            lock_task(&conn, &task_id, &worker).await?;
-            fut.await.map_err(Into::into)
+            match lock_task(&conn, &task_id, &worker).await {
+                Ok(()) => fut.await.map_err(Into::into),
+                Err(e) => {
+                    drop(fut);
+                    log::warn!(
+                        "Refusing to run task {task_id}: could not take the lock for instance {worker}: {e}. Another worker may already own it; it will be reclaimed by orphan recovery if not."
+                    );
+                    Err(e.into())
+                }
+            }
         }
         .boxed()
     }

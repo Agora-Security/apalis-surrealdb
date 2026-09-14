@@ -1,10 +1,15 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    time::Duration,
+    future::Future,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use apalis_core::timer::Delay;
-use surrealdb::types::QueryError;
+use futures::{
+    future::{Either, select},
+    pin_mut,
+};
+use surrealdb::types::{ConnectionError, QueryError};
 
 /// Acknowledge a task on success or failure
 pub mod ack_task;
@@ -39,7 +44,48 @@ pub mod vacuum;
 /// Wait for tasks to reach a terminal state
 pub mod wait_for;
 
-pub(crate) const MAX_TX_RETRIES: usize = 5;
+pub(crate) const MAX_TX_RETRIES: usize = 8;
+
+pub(crate) const CONSECUTIVE_FAILURES_ALARM: u32 = 3;
+
+pub(crate) const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(crate) async fn with_timeout<T>(op: &str, fut: impl Future<Output = T>) -> Option<T> {
+    let timer = Delay::new(QUERY_TIMEOUT);
+    pin_mut!(fut);
+    pin_mut!(timer);
+    match select(fut, timer).await {
+        Either::Left((value, _)) => Some(value),
+        Either::Right(_) => {
+            log::warn!(
+                "{op} did not answer within {QUERY_TIMEOUT:?}, abandoning the request; the \
+                 connection is most likely reconnecting"
+            );
+            None
+        }
+    }
+}
+
+pub(crate) fn timeout_error(op: &str) -> surrealdb::Error {
+    surrealdb::Error::query(
+        format!("{op} timed out after {QUERY_TIMEOUT:?}"),
+        QueryError::TimedOut {
+            duration: QUERY_TIMEOUT,
+        },
+    )
+}
+
+const TX_CONFLICT_BASE: Duration = Duration::from_millis(50);
+
+const TX_CONFLICT_CAP: Duration = Duration::from_secs(2);
+
+pub(crate) fn with_jitter(base: Duration) -> Duration {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let fraction = f64::from(nanos) / f64::from(1_000_000_000u32);
+    base.mul_f64(0.75 + fraction * 0.5)
+}
 
 /// First delay before retrying a transaction the datastore refused to start; doubled per attempt,
 /// so the retries span a few seconds — long enough to ride out a PD/TSO re-election.
@@ -65,6 +111,39 @@ pub(crate) async fn tx_unavailable_backoff(op: &str, attempt: usize) {
     let delay = TX_UNAVAILABLE_BASE * 2u32.pow(exp);
     log::warn!("SurrealDB could not start the {op} transaction, retrying in {delay:?}");
     Delay::new(delay).await;
+}
+
+#[allow(dead_code)]
+pub(crate) async fn tx_conflict_backoff(op: &str, attempt: usize) {
+    let exp = u32::try_from(attempt).unwrap_or(u32::MAX).min(8);
+    let delay = with_jitter(
+        TX_CONFLICT_BASE
+            .saturating_mul(2u32.saturating_pow(exp))
+            .min(TX_CONFLICT_CAP),
+    );
+    log::debug!("Transaction conflict on {op}, replaying attempt {attempt} in {delay:?}");
+    Delay::new(delay).await;
+}
+
+#[allow(dead_code)]
+pub(crate) fn is_retryable_transport(err: &surrealdb::Error) -> bool {
+    if matches!(
+        err.connection_details(),
+        Some(ConnectionError::ConnectionFailed | ConnectionError::Uninitialised)
+    ) {
+        return true;
+    }
+    let message = err.message().to_ascii_lowercase();
+    [
+        "connection",
+        "not connected",
+        "broken pipe",
+        "closed",
+        "timed out",
+        "reset by peer",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 fn is_conflict(err: &surrealdb::Error) -> bool {

@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 use std::sync::Arc;
+use std::time::Duration;
 use std::{fmt, marker::PhantomData};
 
 use apalis_codec::json::JsonCodec;
@@ -9,6 +10,7 @@ use apalis_core::{
     features_table,
     layers::Stack,
     task::Task,
+    timer::Delay,
     worker::{context::WorkerContext, ext::ack::AcknowledgeLayer},
 };
 use apalis_sql::context::SqlContext;
@@ -37,6 +39,7 @@ use crate::{
         keep_alive::{initial_heartbeat, keep_alive_stream},
         kill_task::kill_task,
         reenqueue_orphaned::reenqueue_orphaned_stream,
+        with_jitter,
     },
     sink::SurrealSink,
 };
@@ -81,13 +84,49 @@ where
     }
 }
 
+const REGISTER_ATTEMPTS: u32 = 5;
+
+const REGISTER_BACKOFF_BASE: Duration = Duration::from_millis(250);
+
+pub(crate) async fn register_with_retry(
+    conn: &Arc<Surreal<Any>>,
+    config: &Config,
+    worker: &WorkerContext,
+    storage_name: &str,
+    instance: &str,
+) -> Result<Option<SurrealTask<CompactType>>, SurrealError> {
+    for attempt in 0..REGISTER_ATTEMPTS {
+        match initial_heartbeat(conn, config, worker, storage_name, instance).await {
+            Ok(()) => return Ok(None),
+            Err(e) => {
+                log::warn!(
+                    "Failed to register worker {} (instance {instance}) on attempt {} of \
+                     {REGISTER_ATTEMPTS}: {e}",
+                    worker.name(),
+                    attempt + 1
+                );
+                if attempt + 1 < REGISTER_ATTEMPTS {
+                    Delay::new(with_jitter(REGISTER_BACKOFF_BASE * 2u32.pow(attempt))).await;
+                }
+            }
+        }
+    }
+    log::error!(
+        "Giving up on registering worker {} (instance {instance}) after {REGISTER_ATTEMPTS} \
+         attempts; it will keep polling and the keep-alive stream will register it once the \
+         database is reachable",
+        worker.name()
+    );
+    Ok(None)
+}
+
 pub(crate) fn new_instance() -> Arc<str> {
     Arc::from(Ulid::new().to_string())
 }
 
 const SCHEMA: &str = include_str!("schema.surql");
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 pub const JOB_TABLE: &str = "job";
 
@@ -132,6 +171,7 @@ pub struct SurrealStorage<T, C, Fetcher> {
     conn: Arc<Surreal<Any>>,
     /// Identifies this worker run
     instance: Arc<str>,
+    storage_name: &'static str,
     job_type: PhantomData<T>,
     codec: PhantomData<C>,
     config: Config,
@@ -148,6 +188,7 @@ impl<T, C, F> fmt::Debug for SurrealStorage<T, C, F> {
             .field("job_type", &"PhantomData<T>")
             .field("codec", &std::any::type_name::<C>())
             .field("config", &self.config)
+            .field("storage_name", &self.storage_name)
             .finish()
     }
 }
@@ -157,6 +198,7 @@ impl<T, C, F: Clone> Clone for SurrealStorage<T, C, F> {
         Self {
             conn: self.conn.clone(),
             instance: self.instance.clone(),
+            storage_name: self.storage_name,
             job_type: PhantomData,
             codec: self.codec,
             config: self.config.clone(),
@@ -205,6 +247,7 @@ impl<T> SurrealStorage<T, (), ()> {
         SurrealStorage {
             conn: conn.clone(),
             instance: new_instance(),
+            storage_name: "SurrealStorage",
             job_type: PhantomData,
             codec: PhantomData,
             config: config.clone(),
@@ -222,6 +265,7 @@ impl<T> SurrealStorage<T, (), ()> {
         SurrealStorage {
             conn: conn.clone(),
             instance: new_instance(),
+            storage_name: "SurrealStorageWithEvents",
             job_type: PhantomData,
             codec: PhantomData,
             config: config.clone(),
@@ -238,6 +282,7 @@ impl<T, C, F> SurrealStorage<T, C, F> {
         SurrealStorage {
             conn: self.conn,
             instance: self.instance,
+            storage_name: self.storage_name,
             job_type: PhantomData,
             codec: PhantomData,
             config: self.config,
@@ -268,14 +313,16 @@ impl<Args, Decode, F> SurrealStorage<Args, Decode, F> {
             self.conn.clone(),
             self.config.clone(),
             worker.clone(),
+            self.storage_name,
             self.instance.clone(),
         );
-        let reenqueue = reenqueue_orphaned_stream(
-            self.conn.clone(),
-            self.config.clone(),
+        let orphan_interval = std::cmp::max(
+            self.config.reenqueue_orphaned_after() / 2,
             *self.config.keep_alive(),
-        )
-        .map_ok(|_| ());
+        );
+        let reenqueue =
+            reenqueue_orphaned_stream(self.conn.clone(), self.config.clone(), orphan_interval)
+                .map_ok(|_| ());
         select(keep_alive, reenqueue).boxed()
     }
 
@@ -296,10 +343,9 @@ impl<Args, Decode: Send + 'static, F> SurrealStorage<Args, Decode, F> {
         let config = self.config.clone();
         let registered = worker.clone();
         let instance = self.instance.clone();
+        let storage_name = self.storage_name;
         let register = stream::once(async move {
-            initial_heartbeat(&conn, &config, &registered, "SurrealStorage", &instance)
-                .await
-                .map(|()| None::<SurrealTask<CompactType>>)
+            register_with_retry(&conn, &config, &registered, storage_name, &instance).await
         });
         register.chain(SurrealPollFetcher::<CompactType, Decode>::new(
             &self.conn,
@@ -321,16 +367,9 @@ impl<Args, Decode: Send + 'static> SurrealStorage<Args, Decode, SurrealLiveFetch
         let reg_config = self.config.clone();
         let reg_worker = worker.clone();
         let instance = self.instance.clone();
+        let storage_name = self.storage_name;
         let register = stream::once(async move {
-            initial_heartbeat(
-                &reg_conn,
-                &reg_config,
-                &reg_worker,
-                "SurrealStorageWithEvents",
-                &instance,
-            )
-            .await
-            .map(|()| None::<SurrealTask<CompactType>>)
+            register_with_retry(&reg_conn, &reg_config, &reg_worker, storage_name, &instance).await
         });
 
         let eager_fetcher: SurrealPollFetcher<CompactType, Decode> =
@@ -351,7 +390,10 @@ impl<Args, Decode: Send + 'static> SurrealStorage<Args, Decode, SurrealLiveFetch
             })
             .flat_map(|res| match res {
                 Ok(tasks) => stream::iter(tasks).map(Ok).boxed(),
-                Err(e) => stream::iter(vec![Err(e)]).boxed(),
+                Err(e) => {
+                    log::error!("Failed to claim tasks woken by a live notification: {e}");
+                    stream::empty().boxed()
+                }
             })
             .map(|res| res.map(Some));
 

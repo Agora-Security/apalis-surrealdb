@@ -1,3 +1,5 @@
+use std::future::IntoFuture;
+
 use surrealdb::{
     Surreal,
     engine::any::Any,
@@ -6,7 +8,10 @@ use surrealdb::{
 
 use crate::{
     SurrealError,
-    queries::{MAX_TX_RETRIES, TxOutcome, classify_tx_errors, tx_unavailable_backoff},
+    queries::{
+        MAX_TX_RETRIES, TxOutcome, classify_tx_errors, is_retryable_transport, tx_conflict_backoff,
+        tx_unavailable_backoff, with_timeout,
+    },
 };
 
 const KILL_TASK: &str = include_str!(concat!(
@@ -21,13 +26,32 @@ pub async fn kill_task(
 ) -> Result<(), SurrealError> {
     let mut last_err = None;
     for attempt in 0..MAX_TX_RETRIES {
-        let mut response = conn
-            .query(KILL_TASK)
-            .bind(("id", id.clone()))
-            .bind(("reason", reason.to_owned()))
-            .await?;
+        let queried = with_timeout(
+            "kill_task",
+            conn.query(KILL_TASK)
+                .bind(("id", id.clone()))
+                .bind(("reason", reason.to_owned()))
+                .into_future(),
+        )
+        .await;
+        let Some(queried) = queried else {
+            tx_unavailable_backoff("kill_task", attempt).await;
+            continue;
+        };
+        let mut response = match queried {
+            Ok(response) => response,
+            Err(err) if is_retryable_transport(&err) => {
+                last_err = Some(err);
+                tx_unavailable_backoff("kill_task", attempt).await;
+                continue;
+            }
+            Err(err) => return Err(SurrealError::Database(err)),
+        };
         match classify_tx_errors(response.take_errors()) {
-            Some(TxOutcome::Retry(err)) => last_err = Some(err),
+            Some(TxOutcome::Retry(err)) => {
+                last_err = Some(err);
+                tx_conflict_backoff("kill_task", attempt).await;
+            }
             Some(TxOutcome::Unavailable(err)) => {
                 last_err = Some(err);
                 tx_unavailable_backoff("kill_task", attempt).await;

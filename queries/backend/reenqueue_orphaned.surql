@@ -1,28 +1,41 @@
+BEGIN;
 LET $live = SELECT VALUE instance FROM worker
     WHERE queue = $queue AND last_seen >= time::now() - duration::from_millis($dur);
-LET $orphaned = SELECT id, attempts + 1 AS spent, max_attempts FROM job
+
+LET $claimed = SELECT id, attempts, max_attempts FROM job
     WHERE queue = $queue
+      AND status = 'Queued'
       AND lock_at != NONE
       AND lock_at <= time::now() - duration::from_millis($dur)
-      AND ((status IN ['Queued', 'Running'] AND lock_by != NONE AND lock_by NOTINSIDE $live)
-           OR (status = 'Queued' AND lock_by IS NONE));
--- the orphaned run itself spends an attempt, so max_attempts is what caps reclaims
-LET $exhausted = SELECT VALUE id FROM $orphaned WHERE spent >= max_attempts;
-LET $retriable = SELECT VALUE id FROM $orphaned WHERE spent < max_attempts;
-UPDATE $exhausted SET
-    status = 'Killed',
-    attempts = attempts + 1,
-    lock_by = NONE,
-    lock_at = NONE,
-    done_at = time::now(),
-    last_result = { Err: 'Killed: orphaned by a dead worker with no attempts left.' };
-UPDATE $retriable SET
-    status = 'Pending',
-    attempts = attempts + 1,
-    lock_by = NONE,
-    lock_at = NONE,
-    done_at = NONE,
-    last_result = { Err: 'Re-enqueued: locking worker instance is no longer live.' };
+      AND (lock_by IS NONE OR lock_by NOTINSIDE $live);
+LET $claimed_retriable = SELECT VALUE id FROM $claimed WHERE attempts < max_attempts;
+LET $claimed_exhausted = SELECT VALUE id FROM $claimed WHERE attempts >= max_attempts;
 
-DELETE worker WHERE queue = $queue
-    AND last_seen < time::now() - duration::from_millis($dur * 4);
+LET $running = SELECT id, attempts + 1 AS spent, max_attempts FROM job
+    WHERE queue = $queue
+      AND status = 'Running'
+      AND lock_at != NONE
+      AND lock_at <= time::now() - duration::from_millis($dur)
+      AND (lock_by IS NONE OR lock_by NOTINSIDE $live);
+LET $running_retriable = SELECT VALUE id FROM $running WHERE spent < max_attempts;
+LET $running_exhausted = SELECT VALUE id FROM $running WHERE spent >= max_attempts;
+
+UPDATE $claimed_retriable SET
+    status = 'Pending', lock_by = NONE, lock_at = NONE, done_at = NONE;
+
+UPDATE $claimed_exhausted SET
+    status = 'Killed', lock_by = NONE, lock_at = NONE, done_at = time::now(),
+    last_result = { Err: 'Killed: claimed by a worker that stopped reporting, with no attempts left.' };
+
+UPDATE $running_retriable SET
+    status = 'Pending', attempts = attempts + 1,
+    lock_by = NONE, lock_at = NONE, done_at = NONE, run_at = time::now(),
+    last_result = { Err: 'Re-enqueued: the worker running this task is no longer live.' };
+
+UPDATE $running_exhausted SET
+    status = 'Killed', attempts = attempts + 1,
+    lock_by = NONE, lock_at = NONE, done_at = time::now(),
+    last_result = { Err: 'Killed: the worker running this task stopped reporting and no attempts remain.' };
+
+DELETE worker WHERE queue = $queue AND last_seen < time::now() - duration::from_millis($reap);
+COMMIT;

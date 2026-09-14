@@ -1,11 +1,19 @@
+use std::future::IntoFuture;
+
 use surrealdb::{
     Surreal,
     engine::any::Any,
-    types::{RecordId, Value},
+    types::{QueryError, RecordId, Value},
 };
 use ulid::Ulid;
 
-use crate::{JOB_TABLE, SurrealError};
+use crate::{
+    JOB_TABLE, SurrealError,
+    queries::{
+        MAX_TX_RETRIES, TxOutcome, classify_tx_errors, is_retryable_transport, tx_conflict_backoff,
+        tx_unavailable_backoff, with_timeout,
+    },
+};
 
 const LOCK_TASK: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -19,14 +27,54 @@ pub async fn lock_task(
     worker: &str,
 ) -> Result<(), SurrealError> {
     let id = RecordId::new(JOB_TABLE, task_id.to_string());
-    let mut response = conn
-        .query(LOCK_TASK)
-        .bind(("id", id))
-        .bind(("worker", worker.to_owned()))
-        .await?;
-    let updated: Vec<Value> = response.take(0)?;
-    if updated.is_empty() {
-        return Err(SurrealError::TaskNotFound(task_id.to_string()));
+
+    let mut last_err = None;
+    for attempt in 0..MAX_TX_RETRIES {
+        let queried = with_timeout(
+            "lock_task",
+            conn.query(LOCK_TASK)
+                .bind(("id", id.clone()))
+                .bind(("worker", worker.to_owned()))
+                .into_future(),
+        )
+        .await;
+        let Some(queried) = queried else {
+            tx_unavailable_backoff("lock_task", attempt).await;
+            continue;
+        };
+        let mut response = match queried {
+            Ok(response) => response,
+            Err(err) if is_retryable_transport(&err) => {
+                last_err = Some(err);
+                tx_unavailable_backoff("lock_task", attempt).await;
+                continue;
+            }
+            Err(err) => return Err(SurrealError::Database(err)),
+        };
+        match classify_tx_errors(response.take_errors()) {
+            Some(TxOutcome::Retry(err)) => {
+                last_err = Some(err);
+                tx_conflict_backoff("lock_task", attempt).await;
+                continue;
+            }
+            Some(TxOutcome::Unavailable(err)) => {
+                last_err = Some(err);
+                tx_unavailable_backoff("lock_task", attempt).await;
+                continue;
+            }
+            Some(TxOutcome::Fail(err)) => return Err(SurrealError::Database(err)),
+            None => {}
+        }
+        let updated: Vec<Value> = response.take(0)?;
+        if updated.is_empty() {
+            return Err(SurrealError::TaskNotFound(task_id.to_string()));
+        }
+        return Ok(());
     }
-    Ok(())
+    Err(SurrealError::Database(last_err.unwrap_or_else(|| {
+        surrealdb::Error::query(
+            "Transaction conflict retries exhausted".to_owned(),
+            QueryError::TransactionConflict,
+        )
+    })))
 }

@@ -18,6 +18,8 @@ const FETCH_COMPLETED_TASKS: &str = include_str!(concat!(
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+
 #[derive(Debug, SurrealValue)]
 struct ResultRow {
     id: String,
@@ -32,9 +34,14 @@ impl ResultRow {
     {
         let task_id = TaskId::from_str(&self.id).map_err(|e| SurrealError::Decode(Box::new(e)))?;
         let status = Status::from_str(&self.status).map_err(|e| SurrealError::Decode(e.into()))?;
-        let result: Result<O, String> =
-            serde_json::from_value(self.result.unwrap_or(serde_json::Value::Null))
-                .map_err(|e| SurrealError::Decode(e.into()))?;
+        let result: Result<O, String> = match self.result {
+            Some(value) => {
+                serde_json::from_value(value).map_err(|e| SurrealError::Decode(e.into()))?
+            }
+            None => Err(format!(
+                "task reached status {status} with no recorded result"
+            )),
+        };
         Ok(TaskResult::new(task_id, status, result))
     }
 }
@@ -62,39 +69,60 @@ where
         let conn = self.conn.clone();
         let ids: HashSet<String> = task_ids.into_iter().map(|id| id.to_string()).collect();
 
-        stream::unfold(ids, move |mut remaining| {
-            let conn = conn.clone();
-            async move {
-                if remaining.is_empty() {
-                    return None;
+        stream::unfold(
+            (ids, 0u32, false),
+            move |(mut remaining, mut failures, started)| {
+                let conn = conn.clone();
+                async move {
+                    if remaining.is_empty() {
+                        return None;
+                    }
+                    if started {
+                        apalis_core::timer::sleep(POLL_INTERVAL).await;
+                    }
+                    let fetch = async {
+                        let mut response = conn
+                            .query(FETCH_COMPLETED_TASKS)
+                            .bind(("ids", record_ids(remaining.iter())))
+                            .await?;
+                        response
+                            .take::<Vec<ResultRow>>(0)
+                            .map_err(SurrealError::from)
+                    };
+                    let rows = match fetch.await {
+                        Ok(rows) => {
+                            failures = 0;
+                            rows
+                        }
+                        Err(e) => {
+                            failures += 1;
+                            if failures >= MAX_CONSECUTIVE_FAILURES {
+                                log::error!(
+                                    "Giving up waiting on {} task(s): {failures} consecutive failures fetching completed tasks, last error: {e}",
+                                    remaining.len()
+                                );
+                                return Some((
+                                    stream::iter(vec![Err(e)]),
+                                    (HashSet::new(), failures, true),
+                                ));
+                            }
+                            log::warn!(
+                                "Failed to fetch completed tasks ({failures}/{MAX_CONSECUTIVE_FAILURES} consecutive): {e}. Retrying in {POLL_INTERVAL:?}."
+                            );
+                            return Some((stream::iter(Vec::new()), (remaining, failures, true)));
+                        }
+                    };
+                    let results = rows
+                        .into_iter()
+                        .map(|row| {
+                            remaining.remove(&row.id);
+                            row.into_task_result()
+                        })
+                        .collect::<Vec<_>>();
+                    Some((stream::iter(results), (remaining, failures, true)))
                 }
-                let fetch = async {
-                    let mut response = conn
-                        .query(FETCH_COMPLETED_TASKS)
-                        .bind(("ids", record_ids(remaining.iter())))
-                        .await?;
-                    response
-                        .take::<Vec<ResultRow>>(0)
-                        .map_err(SurrealError::from)
-                };
-                let rows = match fetch.await {
-                    Ok(rows) => rows,
-                    Err(e) => return Some((stream::iter(vec![Err(e)]), HashSet::new())),
-                };
-                if rows.is_empty() {
-                    apalis_core::timer::sleep(POLL_INTERVAL).await;
-                    return Some((stream::iter(Vec::new()), remaining));
-                }
-                let results = rows
-                    .into_iter()
-                    .map(|row| {
-                        remaining.remove(&row.id);
-                        row.into_task_result()
-                    })
-                    .collect::<Vec<_>>();
-                Some((stream::iter(results), remaining))
-            }
-        })
+            },
+        )
         .flatten()
         .boxed()
     }
@@ -111,7 +139,20 @@ where
                 .bind(("ids", record_ids(ids.iter())))
                 .await?;
             let rows: Vec<ResultRow> = response.take(0)?;
-            rows.into_iter().map(ResultRow::into_task_result).collect()
+            let results = rows
+                .into_iter()
+                .filter_map(|row| {
+                    let id = row.id.clone();
+                    match row.into_task_result() {
+                        Ok(result) => Some(result),
+                        Err(e) => {
+                            log::warn!("Skipping task {id}: its result row failed to decode: {e}");
+                            None
+                        }
+                    }
+                })
+                .collect();
+            Ok(results)
         }
     }
 }

@@ -1,3 +1,5 @@
+use std::future::IntoFuture;
+
 use surrealdb::{Surreal, engine::any::Any};
 
 use crate::{
@@ -5,7 +7,8 @@ use crate::{
     from_row::SurrealTaskRow,
     queries::{
         MAX_TX_RETRIES, TxOutcome, classify_tx_errors, fetch_next::decode_row,
-        kill_task::kill_task, tx_unavailable_backoff,
+        is_retryable_transport, kill_task::kill_task, tx_conflict_backoff, tx_unavailable_backoff,
+        with_timeout,
     },
 };
 
@@ -22,14 +25,31 @@ pub async fn fetch_next_shared(
 ) -> Result<Vec<SurrealTask<CompactType>>, SurrealError> {
     let mut last_err = None;
     for attempt in 0..MAX_TX_RETRIES {
-        let mut response = conn
-            .query(FETCH_NEXT_SHARED)
-            .bind(("queues", queues.to_vec()))
-            .bind(("limit", limit))
-            .await?;
+        let queried = with_timeout(
+            "fetch_next_shared",
+            conn.query(FETCH_NEXT_SHARED)
+                .bind(("queues", queues.to_vec()))
+                .bind(("limit", limit))
+                .into_future(),
+        )
+        .await;
+        let Some(queried) = queried else {
+            tx_unavailable_backoff("fetch_next_shared", attempt).await;
+            continue;
+        };
+        let mut response = match queried {
+            Ok(response) => response,
+            Err(err) if is_retryable_transport(&err) => {
+                last_err = Some(err);
+                tx_unavailable_backoff("fetch_next_shared", attempt).await;
+                continue;
+            }
+            Err(err) => return Err(SurrealError::Database(err)),
+        };
         match classify_tx_errors(response.take_errors()) {
             Some(TxOutcome::Retry(err)) => {
                 last_err = Some(err);
+                tx_conflict_backoff("fetch_next_shared", attempt).await;
                 continue;
             }
             Some(TxOutcome::Unavailable(err)) => {
@@ -40,8 +60,7 @@ pub async fn fetch_next_shared(
             Some(TxOutcome::Fail(err)) => return Err(SurrealError::Database(err)),
             None => {}
         }
-        // BEGIN and COMMIT each occupy a result index, so the UPDATE is at 2
-        let rows: Vec<SurrealTaskRow> = response.take(2)?;
+        let rows: Vec<SurrealTaskRow> = response.take(5)?;
         let mut tasks = Vec::with_capacity(rows.len());
         for row in rows {
             let id = row.id.clone();

@@ -20,6 +20,11 @@ DEFINE INDEX IF NOT EXISTS job_fetch ON job COLUMNS queue, status, run_at;
 DEFINE INDEX IF NOT EXISTS job_lock_by ON job COLUMNS lock_by;
 DEFINE INDEX IF NOT EXISTS job_done ON job COLUMNS queue, done_at;
 DEFINE INDEX IF NOT EXISTS job_idempotency ON job COLUMNS queue, idempotency_key;
+DEFINE INDEX IF NOT EXISTS job_orphan ON job COLUMNS queue, status, lock_at;
+
+DEFINE TABLE IF NOT EXISTS job_dedupe SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS job ON job_dedupe TYPE record<job>;
+DEFINE FIELD IF NOT EXISTS created_at ON job_dedupe TYPE datetime DEFAULT time::now();
 
 DEFINE TABLE IF NOT EXISTS worker SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS name ON worker TYPE string DEFAULT '';
@@ -30,6 +35,7 @@ DEFINE FIELD IF NOT EXISTS instance ON worker TYPE string DEFAULT '';
 DEFINE FIELD IF NOT EXISTS started_at ON worker TYPE datetime DEFAULT time::now();
 DEFINE FIELD IF NOT EXISTS last_seen ON worker TYPE datetime DEFAULT time::now();
 DEFINE INDEX IF NOT EXISTS worker_queue ON worker COLUMNS queue;
+DEFINE INDEX IF NOT EXISTS worker_liveness ON worker COLUMNS queue, last_seen;
 
 DEFINE TABLE IF NOT EXISTS apalis_meta SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS version ON apalis_meta TYPE int;

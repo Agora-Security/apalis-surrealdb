@@ -16,7 +16,7 @@ use apalis_core::{
     worker::{context::WorkerContext, ext::ack::AcknowledgeLayer},
 };
 use futures::{
-    FutureExt, SinkExt, Stream, StreamExt,
+    FutureExt, Stream, StreamExt,
     channel::mpsc::{self, Receiver, Sender},
     future::{BoxFuture, Shared},
     lock::Mutex,
@@ -28,8 +28,7 @@ use ulid::Ulid;
 use crate::{
     CompactType, Config, LockTaskLayer, SurrealAck, SurrealContext, SurrealError,
     SurrealLiveFetcher, SurrealPollFetcher, SurrealStorage, SurrealTask,
-    queries::{fetch_next_shared::fetch_next_shared, keep_alive::initial_heartbeat},
-    sink::SurrealSink,
+    queries::fetch_next_shared::fetch_next_shared, sink::SurrealSink,
 };
 
 type Registry = Arc<Mutex<HashMap<String, Sender<SurrealTask<CompactType>>>>>;
@@ -94,6 +93,10 @@ impl SharedSurrealStorage<JsonCodec<CompactType>> {
     }
 }
 
+const WAKE_CHUNK: usize = 1;
+
+const MIN_CLAIM_BATCH: usize = 10;
+
 // fan claimed tasks out to the perqueue channels, waking on live notifications or a fallback tick
 async fn drive_registry(conn: Arc<Surreal<Any>>, registry: Registry, fallback: Duration) {
     let live = SurrealLiveFetcher::new(&conn);
@@ -101,32 +104,59 @@ async fn drive_registry(conn: Arc<Surreal<Any>>, registry: Registry, fallback: D
         Delay::new(fallback).await;
         Some(((), ()))
     });
-    let chunk = registry.try_lock().map_or(1, |r| r.len().max(1));
     select(live, ticks)
-        .ready_chunks(chunk)
+        .ready_chunks(WAKE_CHUNK)
         .for_each(move |_| {
             let conn = conn.clone();
             let registry = registry.clone();
             async move {
-                let queues: Vec<String> = registry.lock().await.keys().cloned().collect();
-                if queues.is_empty() {
+                let mut senders: HashMap<String, Sender<SurrealTask<CompactType>>> =
+                    registry.lock().await.clone();
+                if senders.is_empty() {
                     return;
                 }
-                let limit = std::cmp::max(10, queues.len()) as i64;
-                match fetch_next_shared(&conn, &queues, limit).await {
-                    Ok(tasks) => {
-                        let mut registry = registry.lock().await;
-                        for task in tasks {
-                            let Some(queue) = task.parts.ctx.queue().clone() else {
-                                continue;
-                            };
-                            // a task whose channel is gone is dropped, its queue is no longer registered
-                            if let Some(tx) = registry.get_mut(&queue) {
-                                let _ = tx.send(task).await;
-                            }
-                        }
+                let queues: Vec<String> = senders.keys().cloned().collect();
+                let limit = std::cmp::max(MIN_CLAIM_BATCH, queues.len()) as i64;
+                let tasks = match fetch_next_shared(&conn, &queues, limit).await {
+                    Ok(tasks) => tasks,
+                    Err(err) => {
+                        log::error!("Shared driver failed to claim tasks: {err}");
+                        return;
                     }
-                    Err(err) => log::error!("Shared driver failed to claim tasks: {err}"),
+                };
+                let mut dead: Vec<String> = Vec::new();
+                for task in tasks {
+                    let Some(queue) = task.parts.ctx.queue().clone() else {
+                        continue;
+                    };
+                    let Some(tx) = senders.get_mut(&queue) else {
+                        continue;
+                    };
+                    let disconnected = match tx.try_send(task) {
+                        Ok(()) => false,
+                        Err(err) if err.is_full() => {
+                            log::debug!("Shared driver: queue {queue} is saturated, task deferred");
+                            drop(err.into_inner());
+                            false
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "Shared driver: queue {queue} has no receiver, unregistering"
+                            );
+                            drop(err.into_inner());
+                            true
+                        }
+                    };
+                    if disconnected {
+                        senders.remove(&queue);
+                        dead.push(queue);
+                    }
+                }
+                if !dead.is_empty() {
+                    let mut registry = registry.lock().await;
+                    for queue in dead {
+                        registry.remove(&queue);
+                    }
                 }
             }
         })
@@ -179,6 +209,7 @@ impl<Args, Decode: Codec<Args, Compact = CompactType>> MakeShared<Args>
         Ok(SurrealStorage {
             conn: self.conn.clone(),
             instance: crate::new_instance(),
+            storage_name: "SharedSurrealStorage",
             job_type: PhantomData,
             codec: PhantomData,
             config,
@@ -238,7 +269,6 @@ where
     type Error = SurrealError;
     type Stream = TaskStream<SurrealTask<Args>, SurrealError>;
     type Beat = BoxStream<'static, Result<(), SurrealError>>;
-    // ack must wrap lock so it snapshots the lock_by the lock layer sets, the shared claim leaves it unset
     type Layer = Stack<AcknowledgeLayer<SurrealAck>, LockTaskLayer>;
 
     fn heartbeat(&self, worker: &WorkerContext) -> Self::Beat {
@@ -293,16 +323,9 @@ impl<Args, Decode: Send + 'static> SurrealStorage<Args, Decode, SharedFetcher<Co
         let config = self.config.clone();
         let registered = worker.clone();
         let instance = self.instance.clone();
+        let storage_name = self.storage_name;
         let register = stream::once(async move {
-            initial_heartbeat(
-                &conn,
-                &config,
-                &registered,
-                "SharedSurrealStorage",
-                &instance,
-            )
-            .await
-            .map(|()| None::<SurrealTask<CompactType>>)
+            crate::register_with_retry(&conn, &config, &registered, storage_name, &instance).await
         });
         let eager = SurrealPollFetcher::<CompactType, Decode>::new(
             &self.conn,

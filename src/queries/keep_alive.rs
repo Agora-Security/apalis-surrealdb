@@ -1,5 +1,6 @@
 use apalis_core::{timer::Delay, worker::context::WorkerContext};
 use futures::{Stream, stream};
+use std::future::IntoFuture;
 use std::sync::Arc;
 use surrealdb::{
     Surreal,
@@ -9,7 +10,10 @@ use surrealdb::{
 
 use crate::{
     Config, SurrealError, WORKER_TABLE,
-    queries::{reenqueue_orphaned::reenqueue_orphaned, register_worker::register_worker},
+    queries::{
+        CONSECUTIVE_FAILURES_ALARM, reenqueue_orphaned::reenqueue_orphaned,
+        register_worker::register_worker, timeout_error, with_timeout,
+    },
 };
 
 const KEEP_ALIVE: &str = include_str!(concat!(
@@ -20,18 +24,28 @@ const KEEP_ALIVE: &str = include_str!(concat!(
 /// Refresh the worker heartbeat so it is not treated as orphaned
 pub async fn keep_alive(
     conn: &Arc<Surreal<Any>>,
-    _config: &Config,
+    config: &Config,
     worker: &WorkerContext,
+    storage_name: &str,
     instance: &str,
 ) -> Result<(), SurrealError> {
     let id = RecordId::new(WORKER_TABLE, instance.to_owned());
-    let mut response = conn.query(KEEP_ALIVE).bind(("worker", id)).await?;
+    let Some(queried) = with_timeout(
+        "keep_alive",
+        conn.query(KEEP_ALIVE).bind(("worker", id)).into_future(),
+    )
+    .await
+    else {
+        return Err(SurrealError::Database(timeout_error("keep_alive")));
+    };
+    let mut response = queried?;
     let updated: Vec<Value> = response.take(0)?;
     if updated.is_empty() {
-        return Err(SurrealError::WorkerNotFound(format!(
-            "{} (instance {instance})",
+        log::warn!(
+            "Worker row for {} (instance {instance}) is gone, re-registering it",
             worker.name()
-        )));
+        );
+        register_worker(conn, config, worker, storage_name, instance).await?;
     }
     Ok(())
 }
@@ -54,17 +68,36 @@ pub fn keep_alive_stream(
     conn: Arc<Surreal<Any>>,
     config: Config,
     worker: WorkerContext,
+    storage_name: &'static str,
     instance: Arc<str>,
 ) -> impl Stream<Item = Result<(), SurrealError>> + Send {
-    stream::unfold((), move |()| {
+    stream::unfold(0u32, move |failures: u32| {
         let conn = conn.clone();
         let config = config.clone();
         let worker = worker.clone();
         let instance = instance.clone();
         async move {
             Delay::new(*config.keep_alive()).await;
-            let res = keep_alive(&conn, &config, &worker, &instance).await;
-            Some((res, ()))
+            let failures = match keep_alive(&conn, &config, &worker, storage_name, &instance).await
+            {
+                Ok(()) => 0,
+                Err(e) => {
+                    let failures = failures.saturating_add(1);
+                    let name = worker.name();
+                    if failures >= CONSECUTIVE_FAILURES_ALARM {
+                        log::error!(
+                            "keep-alive failed for worker {name} (instance {instance}): {e}; \
+                             {failures} consecutive failures, this worker may be re-enqueued as orphaned"
+                        );
+                    } else {
+                        log::warn!(
+                            "keep-alive failed for worker {name} (instance {instance}): {e}"
+                        );
+                    }
+                    failures
+                }
+            };
+            Some((Ok(()), failures))
         }
     })
 }

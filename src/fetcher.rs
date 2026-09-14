@@ -24,18 +24,24 @@ use surrealdb::{
 };
 
 use crate::{
-    CompactType, Config, JOB_TABLE, SurrealError, SurrealTask, queries::fetch_next::fetch_next,
+    CompactType, Config, JOB_TABLE, SurrealError, SurrealTask,
+    queries::{fetch_next::fetch_next, with_jitter},
 };
 
 /// Marker fetcher that drives the polling backend for [`SurrealStorage`](crate::SurrealStorage)
 #[derive(Clone, Debug)]
 pub struct SurrealFetcher;
 
+const FETCH_BACKOFF_BASE: Duration = Duration::from_millis(250);
+
+const FETCH_BACKOFF_CAP: Duration = Duration::from_secs(30);
+
 enum StreamState {
     Ready,
     Delay,
     Fetch(BoxFuture<'static, Result<Vec<SurrealTask<CompactType>>, SurrealError>>),
     Buffered(VecDeque<SurrealTask<CompactType>>),
+    ErrorBackoff(Delay),
     Empty,
 }
 
@@ -52,6 +58,7 @@ pub struct SurrealPollFetcher<Compact, Decode> {
     #[pin]
     delay_stream: Option<Pin<Box<dyn Stream<Item = ()> + Send>>>,
     prev_count: Arc<AtomicUsize>,
+    consecutive_errors: u32,
 }
 
 impl<Compact, Decode> fmt::Debug for SurrealPollFetcher<Compact, Decode> {
@@ -61,6 +68,7 @@ impl<Compact, Decode> fmt::Debug for SurrealPollFetcher<Compact, Decode> {
             .field("config", &self.config)
             .field("wrk", &self.wrk)
             .field("prev_count", &self.prev_count)
+            .field("consecutive_errors", &self.consecutive_errors)
             .finish()
     }
 }
@@ -76,6 +84,7 @@ impl<Compact, Decode> Clone for SurrealPollFetcher<Compact, Decode> {
             state: StreamState::Ready,
             delay_stream: None,
             prev_count: Arc::new(AtomicUsize::new(0)),
+            consecutive_errors: 0,
         }
     }
 }
@@ -98,6 +107,7 @@ impl<Decode> SurrealPollFetcher<CompactType, Decode> {
             state: StreamState::Ready,
             delay_stream: None,
             prev_count: Arc::new(AtomicUsize::new(0)),
+            consecutive_errors: 0,
         }
     }
 }
@@ -143,7 +153,7 @@ impl<Decode> Stream for SurrealPollFetcher<CompactType, Decode> {
                 StreamState::Fetch(ref mut fut) => match fut.poll_unpin(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(tasks)) => {
-                        // the fetched count drives the poll strategy backoff
+                        this.consecutive_errors = 0;
                         this.prev_count.store(tasks.len(), Ordering::Relaxed);
                         if tasks.is_empty() {
                             this.state = StreamState::Delay;
@@ -152,8 +162,21 @@ impl<Decode> Stream for SurrealPollFetcher<CompactType, Decode> {
                         }
                     }
                     Poll::Ready(Err(e)) => {
-                        this.state = StreamState::Empty;
-                        return Poll::Ready(Some(Err(e)));
+                        this.consecutive_errors = this.consecutive_errors.saturating_add(1);
+                        let failures = this.consecutive_errors;
+                        let exp = failures.saturating_sub(1).min(16);
+                        let backoff = with_jitter(
+                            FETCH_BACKOFF_BASE
+                                .saturating_mul(2u32.saturating_pow(exp))
+                                .min(FETCH_BACKOFF_CAP),
+                        );
+                        log::error!(
+                            "Failed to claim tasks from queue {}: {e}; {failures} consecutive \
+                             failures, retrying in {backoff:?}",
+                            this.config.queue()
+                        );
+                        this.state = StreamState::ErrorBackoff(Delay::new(backoff));
+                        return Poll::Ready(Some(Ok(None)));
                     }
                 },
                 StreamState::Buffered(ref mut buffer) => {
@@ -165,6 +188,10 @@ impl<Decode> Stream for SurrealPollFetcher<CompactType, Decode> {
                     }
                     this.state = StreamState::Ready;
                 }
+                StreamState::ErrorBackoff(ref mut delay) => match delay.poll_unpin(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(()) => this.state = StreamState::Ready,
+                },
                 StreamState::Empty => return Poll::Ready(None),
             }
         }
@@ -269,7 +296,6 @@ impl Stream for SurrealLiveFetcher {
                 LiveState::Active(_, stream) => match stream.poll_next_unpin(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Some(Ok(n))) => {
-                        // a delivered notification proves the stream healthy
                         this.backoff = BACKOFF_BASE;
                         if n.action == Action::Create {
                             return Poll::Ready(Some(()));
