@@ -10,8 +10,8 @@ use ulid::Ulid;
 use crate::{
     CompactType, Config, JOB_TABLE, SurrealError, SurrealTask,
     queries::{
-        MAX_TX_RETRIES, TxOutcome, classify_tx_errors, is_retryable_transport, tx_conflict_backoff,
-        tx_unavailable_backoff, with_timeout,
+        MAX_TX_RETRIES, TxOutcome, classify_tx_errors, is_retryable_transport, timeout_error,
+        tx_conflict_backoff, tx_unavailable_backoff, with_timeout,
     },
 };
 
@@ -95,9 +95,9 @@ pub async fn push_tasks(
                 .into_future(),
         )
         .await;
+        // the batch may have landed: resending could duplicate tasks without an idempotency key
         let Some(queried) = queried else {
-            tx_unavailable_backoff("push_tasks", attempt).await;
-            continue;
+            return Err(SurrealError::Database(timeout_error("push_tasks")));
         };
         let mut response = match queried {
             Ok(response) => response,

@@ -9,8 +9,8 @@ use surrealdb::{
 use crate::{
     SurrealError,
     queries::{
-        MAX_TX_RETRIES, TxOutcome, classify_tx_errors, is_retryable_transport, tx_conflict_backoff,
-        tx_unavailable_backoff, with_timeout,
+        MAX_TX_RETRIES, TxOutcome, classify_tx_errors, is_retryable_transport, timeout_backoff,
+        timeout_error, tx_conflict_backoff, tx_unavailable_backoff, with_timeout,
     },
 };
 
@@ -35,7 +35,8 @@ pub async fn kill_task(
         )
         .await;
         let Some(queried) = queried else {
-            tx_unavailable_backoff("kill_task", attempt).await;
+            last_err = Some(timeout_error("kill_task"));
+            timeout_backoff(attempt).await;
             continue;
         };
         let mut response = match queried {

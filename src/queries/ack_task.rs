@@ -14,8 +14,8 @@ use ulid::Ulid;
 use crate::{
     JOB_TABLE, SurrealContext, SurrealError,
     queries::{
-        MAX_TX_RETRIES, TxOutcome, classify_tx_errors, is_retryable_transport, tx_conflict_backoff,
-        tx_unavailable_backoff, with_jitter, with_timeout,
+        MAX_TX_RETRIES, TxOutcome, classify_tx_errors, is_retryable_transport, timeout_backoff,
+        timeout_error, tx_conflict_backoff, tx_unavailable_backoff, with_jitter, with_timeout,
     },
 };
 
@@ -72,7 +72,8 @@ pub async fn ack_task(
 
         let queried = with_timeout("ack_task", request.into_future()).await;
         let Some(queried) = queried else {
-            tx_unavailable_backoff("ack_task", attempt_no).await;
+            last_err = Some(timeout_error("ack_task"));
+            timeout_backoff(attempt_no).await;
             continue;
         };
         let mut response = match queried {

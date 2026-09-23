@@ -105,12 +105,21 @@ pub(crate) enum TxOutcome {
     Fail(surrealdb::Error),
 }
 
+fn unavailable_delay(attempt: usize) -> Duration {
+    let exp = u32::try_from(attempt).unwrap_or(0).min(8);
+    TX_UNAVAILABLE_BASE * 2u32.pow(exp)
+}
+
 /// Wait out a datastore that could not start the transaction
 pub(crate) async fn tx_unavailable_backoff(op: &str, attempt: usize) {
-    let exp = u32::try_from(attempt).unwrap_or(0).min(8);
-    let delay = TX_UNAVAILABLE_BASE * 2u32.pow(exp);
+    let delay = unavailable_delay(attempt);
     log::warn!("SurrealDB could not start the {op} transaction, retrying in {delay:?}");
     Delay::new(delay).await;
+}
+
+/// Wait before replaying a request that got no answer; `with_timeout` already logged it
+pub(crate) async fn timeout_backoff(attempt: usize) {
+    Delay::new(unavailable_delay(attempt)).await;
 }
 
 #[allow(dead_code)]

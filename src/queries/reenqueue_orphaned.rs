@@ -11,8 +11,8 @@ use crate::{
     Config, SurrealError,
     queries::{
         CONSECUTIVE_FAILURES_ALARM, MAX_TX_RETRIES, TxOutcome, classify_tx_errors,
-        is_retryable_transport, tx_conflict_backoff, tx_unavailable_backoff, with_jitter,
-        with_timeout,
+        is_retryable_transport, timeout_error, tx_conflict_backoff, tx_unavailable_backoff,
+        with_jitter, with_timeout,
     },
 };
 
@@ -70,9 +70,9 @@ pub async fn reenqueue_orphaned(
                 .into_future(),
         )
         .await;
+        // resending on a connection that stopped answering cannot help; the next tick retries
         let Some(queried) = queried else {
-            tx_unavailable_backoff("reenqueue_orphaned", attempt).await;
-            continue;
+            return Err(SurrealError::Database(timeout_error("reenqueue_orphaned")));
         };
         let mut response = match queried {
             Ok(response) => response,

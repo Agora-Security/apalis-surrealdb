@@ -7,8 +7,8 @@ use crate::{
     from_row::SurrealTaskRow,
     queries::{
         MAX_TX_RETRIES, TxOutcome, classify_tx_errors, fetch_next::decode_row,
-        is_retryable_transport, kill_task::kill_task, tx_conflict_backoff, tx_unavailable_backoff,
-        with_timeout,
+        is_retryable_transport, kill_task::kill_task, timeout_error, tx_conflict_backoff,
+        tx_unavailable_backoff, with_timeout,
     },
 };
 
@@ -33,9 +33,9 @@ pub async fn fetch_next_shared(
                 .into_future(),
         )
         .await;
+        // resending on a connection that stopped answering cannot help; the fetcher backs off
         let Some(queried) = queried else {
-            tx_unavailable_backoff("fetch_next_shared", attempt).await;
-            continue;
+            return Err(SurrealError::Database(timeout_error("fetch_next_shared")));
         };
         let mut response = match queried {
             Ok(response) => response,

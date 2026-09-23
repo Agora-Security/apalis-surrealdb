@@ -2,6 +2,7 @@ use apalis_core::{timer::Delay, worker::context::WorkerContext};
 use futures::{Stream, stream};
 use std::future::IntoFuture;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use surrealdb::{
     Surreal,
     engine::any::Any,
@@ -15,6 +16,8 @@ use crate::{
         register_worker::register_worker, timeout_error, with_timeout,
     },
 };
+
+const FATAL_AFTER: Duration = Duration::from_secs(5 * 60);
 
 const KEEP_ALIVE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -63,6 +66,14 @@ pub async fn initial_heartbeat(
     Ok(())
 }
 
+/// How long the heartbeat has been missing, carried across beats. `failing_since` is what decides
+/// the worker's fate; `failures` only picks the log line.
+#[derive(Default)]
+struct State {
+    failures: u32,
+    failing_since: Option<Instant>,
+}
+
 /// Emit a keep-alive at every keep-alive interval
 pub fn keep_alive_stream(
     conn: Arc<Surreal<Any>>,
@@ -71,19 +82,27 @@ pub fn keep_alive_stream(
     storage_name: &'static str,
     instance: Arc<str>,
 ) -> impl Stream<Item = Result<(), SurrealError>> + Send {
-    stream::unfold(0u32, move |failures: u32| {
+    stream::unfold(State::default(), move |state: State| {
         let conn = conn.clone();
         let config = config.clone();
         let worker = worker.clone();
         let instance = instance.clone();
         async move {
             Delay::new(*config.keep_alive()).await;
-            let failures = match keep_alive(&conn, &config, &worker, storage_name, &instance).await
-            {
-                Ok(()) => 0,
+            match keep_alive(&conn, &config, &worker, storage_name, &instance).await {
+                Ok(()) => Some((Ok(()), State::default())),
                 Err(e) => {
-                    let failures = failures.saturating_add(1);
+                    let failures = state.failures.saturating_add(1);
+                    let since = state.failing_since.unwrap_or_else(Instant::now);
                     let name = worker.name();
+                    let down_for = since.elapsed();
+                    if down_for >= FATAL_AFTER {
+                        log::error!(
+                            "keep-alive for worker {name} (instance {instance}) has not landed for \
+                             {down_for:?}: {e}; ending the worker so its connection is rebuilt"
+                        );
+                        return Some((Err(e), State::default()));
+                    }
                     if failures >= CONSECUTIVE_FAILURES_ALARM {
                         log::error!(
                             "keep-alive failed for worker {name} (instance {instance}): {e}; \
@@ -94,10 +113,15 @@ pub fn keep_alive_stream(
                             "keep-alive failed for worker {name} (instance {instance}): {e}"
                         );
                     }
-                    failures
+                    Some((
+                        Ok(()),
+                        State {
+                            failures,
+                            failing_since: Some(since),
+                        },
+                    ))
                 }
-            };
-            Some((Ok(()), failures))
+            }
         }
     })
 }
