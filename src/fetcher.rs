@@ -25,7 +25,7 @@ use surrealdb::{
 
 use crate::{
     CompactType, Config, JOB_TABLE, SurrealError, SurrealTask,
-    queries::{fetch_next::fetch_next, with_jitter},
+    queries::{CONSECUTIVE_FAILURES_ALARM, fetch_next::fetch_next, with_jitter},
 };
 
 /// Marker fetcher that drives the polling backend for [`SurrealStorage`](crate::SurrealStorage)
@@ -35,6 +35,16 @@ pub struct SurrealFetcher;
 const FETCH_BACKOFF_BASE: Duration = Duration::from_millis(250);
 
 const FETCH_BACKOFF_CAP: Duration = Duration::from_secs(30);
+
+/// A claim that fails once is usually a lost race or a blip the backoff absorbs; only a run of
+/// failures is worth an alarm
+pub(crate) fn claim_failure_level(consecutive_failures: u32) -> log::Level {
+    if consecutive_failures >= CONSECUTIVE_FAILURES_ALARM {
+        log::Level::Error
+    } else {
+        log::Level::Debug
+    }
+}
 
 enum StreamState {
     Ready,
@@ -170,9 +180,12 @@ impl<Decode> Stream for SurrealPollFetcher<CompactType, Decode> {
                                 .saturating_mul(2u32.saturating_pow(exp))
                                 .min(FETCH_BACKOFF_CAP),
                         );
-                        log::error!(
-                            "Failed to claim tasks from queue {}: {e}; {failures} consecutive \
-                             failures, retrying in {backoff:?}",
+                        // the counts stay out of the text so a tracker groups every occurrence
+                        log::log!(
+                            claim_failure_level(failures),
+                            failures = failures,
+                            backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX);
+                            "Failed to claim tasks from queue {}: {e}",
                             this.config.queue()
                         );
                         this.state = StreamState::ErrorBackoff(Delay::new(backoff));
@@ -285,9 +298,9 @@ impl Stream for SurrealLiveFetcher {
                     }
                     Poll::Ready(Err(e)) => {
                         log::error!(
+                            backoff_ms = u64::try_from(this.backoff.as_millis()).unwrap_or(u64::MAX);
                             "Failed to subscribe to live query on {JOB_TABLE}: {e}; \
-                             real-time delivery degraded, retrying in {:?} while polling continues",
-                            this.backoff
+                             real-time delivery degraded while polling continues"
                         );
                         this.state = LiveState::Backoff(Delay::new(this.backoff));
                         this.backoff = (this.backoff * 2).min(BACKOFF_CAP);
@@ -317,5 +330,25 @@ impl Stream for SurrealLiveFetcher {
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claim_failures_stay_quiet_until_the_alarm() {
+        // Fails if one lost race is reported as an error again, or if a run of failures is not
+        assert_eq!(claim_failure_level(1), log::Level::Debug);
+        assert_eq!(
+            claim_failure_level(CONSECUTIVE_FAILURES_ALARM - 1),
+            log::Level::Debug
+        );
+        assert_eq!(
+            claim_failure_level(CONSECUTIVE_FAILURES_ALARM),
+            log::Level::Error
+        );
+        assert_eq!(claim_failure_level(u32::MAX), log::Level::Error);
     }
 }

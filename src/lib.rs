@@ -379,6 +379,7 @@ impl<Args, Decode: Send + 'static> SurrealStorage<Args, Decode, SurrealLiveFetch
         let fetch_config = self.config.clone();
         let fetch_instance = self.instance.clone();
         let buffer_size = self.config.buffer_size();
+        let mut consecutive_failures: u32 = 0;
         let lazy_fetcher = self
             .fetcher
             .ready_chunks(buffer_size)
@@ -388,10 +389,19 @@ impl<Args, Decode: Send + 'static> SurrealStorage<Args, Decode, SurrealLiveFetch
                 let instance = fetch_instance.clone();
                 async move { fetch_next(&conn, &config, &instance).await }
             })
-            .flat_map(|res| match res {
-                Ok(tasks) => stream::iter(tasks).map(Ok).boxed(),
+            .flat_map(move |res| match res {
+                Ok(tasks) => {
+                    consecutive_failures = 0;
+                    stream::iter(tasks).map(Ok).boxed()
+                }
                 Err(e) => {
-                    log::error!("Failed to claim tasks woken by a live notification: {e}");
+                    // the eager poller retries the same rows, so one failure is not an alarm
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    log::log!(
+                        fetcher::claim_failure_level(consecutive_failures),
+                        failures = consecutive_failures;
+                        "Failed to claim tasks woken by a live notification: {e}"
+                    );
                     stream::empty().boxed()
                 }
             })

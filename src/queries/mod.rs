@@ -102,6 +102,10 @@ pub(crate) enum TxOutcome {
     Retry(surrealdb::Error),
     /// The transaction never started, so nothing ran: retry once the datastore is back
     Unavailable(surrealdb::Error),
+    /// Every statement ran but `COMMIT` failed for a reason other than a write conflict (key
+    /// locked, region error). Nothing was committed, but only a caller whose block is safe to
+    /// replay should retry it.
+    CommitFailed(surrealdb::Error),
     Fail(surrealdb::Error),
 }
 
@@ -164,6 +168,14 @@ fn is_not_executed(err: &surrealdb::Error) -> bool {
     matches!(err.query_details(), Some(QueryError::NotExecuted))
 }
 
+/// SurrealDB reports a failed `COMMIT` on a row of its own carrying this prefix, and flags every
+/// earlier statement `NotExecuted`; that row is the only one holding the real cause.
+const COMMIT_FAILED: &str = "Cannot COMMIT:";
+
+fn is_commit_failure(err: &surrealdb::Error) -> bool {
+    is_not_executed(err) && err.message().starts_with(COMMIT_FAILED)
+}
+
 fn is_tx_unavailable(err: &surrealdb::Error) -> bool {
     is_not_executed(err) && err.message().contains(TX_UNAVAILABLE)
 }
@@ -179,9 +191,12 @@ pub(crate) fn classify_tx_errors(errors: HashMap<usize, surrealdb::Error>) -> Op
     let mut first_real = None;
     let mut first_not_executed = None;
     let mut first_unavailable = None;
+    let mut commit_failure = None;
     for (_, err) in ordered {
         if is_tx_unavailable(&err) {
             first_unavailable.get_or_insert(err);
+        } else if is_commit_failure(&err) {
+            commit_failure.get_or_insert(err);
         } else if is_conflict(&err) {
             first_conflict.get_or_insert(err);
         } else if is_not_executed(&err) {
@@ -197,8 +212,81 @@ pub(crate) fn classify_tx_errors(errors: HashMap<usize, surrealdb::Error>) -> Op
         Some(TxOutcome::Fail(err))
     } else if let Some(err) = first_conflict {
         Some(TxOutcome::Retry(err))
+    } else if let Some(err) = commit_failure {
+        // the statements' NotExecuted rows only echo the commit; its own row says why
+        Some(TxOutcome::CommitFailed(err))
     } else {
-        // all NotExecuted: shouldn't happen, but fail rather than retry silently
+        // all NotExecuted with no commit row: fail rather than retry silently
         first_not_executed.map(TxOutcome::Fail)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    const ECHO: &str = "The query was not executed due to a failed transaction";
+
+    fn not_executed(message: &str) -> surrealdb::Error {
+        surrealdb::Error::query(message.to_owned(), QueryError::NotExecuted)
+    }
+
+    #[test]
+    fn a_failed_commit_reports_the_commit_row_not_its_echoes() {
+        let errors = HashMap::from([
+            (0, not_executed(ECHO)),
+            (1, not_executed(ECHO)),
+            (2, not_executed("Cannot COMMIT: Key is locked")),
+        ]);
+        match classify_tx_errors(errors) {
+            Some(TxOutcome::CommitFailed(err)) => {
+                assert_eq!(err.message(), "Cannot COMMIT: Key is locked");
+            }
+            other => panic!("expected CommitFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_commit_lost_to_a_write_conflict_stays_a_plain_retry() {
+        let errors = HashMap::from([
+            (0, not_executed(ECHO)),
+            (
+                1,
+                surrealdb::Error::query(
+                    "Cannot COMMIT: Transaction conflict".to_owned(),
+                    QueryError::TransactionConflict,
+                ),
+            ),
+        ]);
+        assert!(matches!(
+            classify_tx_errors(errors),
+            Some(TxOutcome::Retry(_))
+        ));
+    }
+
+    #[test]
+    fn a_failing_statement_outranks_the_commit_it_aborted() {
+        let errors = HashMap::from([
+            (0, not_executed(ECHO)),
+            (1, surrealdb::Error::thrown("bad field".to_owned())),
+            (
+                2,
+                not_executed("Cannot COMMIT: the transaction was aborted due to a prior error"),
+            ),
+        ]);
+        match classify_tx_errors(errors) {
+            Some(TxOutcome::Fail(err)) => assert_eq!(err.message(), "bad field"),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn echoes_without_a_commit_row_still_fail() {
+        let errors = HashMap::from([(0, not_executed(ECHO))]);
+        assert!(matches!(
+            classify_tx_errors(errors),
+            Some(TxOutcome::Fail(_))
+        ));
     }
 }

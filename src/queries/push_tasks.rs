@@ -121,7 +121,9 @@ pub async fn push_tasks(
                 last_err = Some(err);
                 tx_conflict_backoff("push_tasks", attempt).await;
             }
-            Some(TxOutcome::Fail(err)) => return Err(SurrealError::Database(err)),
+            Some(TxOutcome::Fail(err) | TxOutcome::CommitFailed(err)) => {
+                return Err(SurrealError::Database(err));
+            }
             None => return Ok(()),
         }
     }

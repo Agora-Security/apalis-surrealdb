@@ -47,7 +47,8 @@ pub async fn fetch_next_shared(
             Err(err) => return Err(SurrealError::Database(err)),
         };
         match classify_tx_errors(response.take_errors()) {
-            Some(TxOutcome::Retry(err)) => {
+            // a claim that failed to commit claimed nothing, and its guards make the replay safe
+            Some(TxOutcome::Retry(err) | TxOutcome::CommitFailed(err)) => {
                 last_err = Some(err);
                 tx_conflict_backoff("fetch_next_shared", attempt).await;
                 continue;
