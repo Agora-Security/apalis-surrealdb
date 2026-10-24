@@ -95,26 +95,29 @@ pub(crate) async fn register_with_retry(
     storage_name: &str,
     instance: &str,
 ) -> Result<Option<SurrealTask<CompactType>>, SurrealError> {
+    let mut last_error = None;
     for attempt in 0..REGISTER_ATTEMPTS {
         match initial_heartbeat(conn, config, worker, storage_name, instance).await {
             Ok(()) => return Ok(None),
-            Err(e) => {
-                log::warn!(
-                    "Failed to register worker {} (instance {instance}) on attempt {} of \
-                     {REGISTER_ATTEMPTS}: {e}",
+            Err(e) if attempt + 1 < REGISTER_ATTEMPTS => {
+                // Workers booting together race for the same rows and the loser of a write
+                // conflict succeeds on retry: worth a line in the log, not an alert.
+                log::info!(
+                    "Retrying registration of worker {} (instance {instance}) after attempt {} \
+                     of {REGISTER_ATTEMPTS}: {e}",
                     worker.name(),
                     attempt + 1
                 );
-                if attempt + 1 < REGISTER_ATTEMPTS {
-                    Delay::new(with_jitter(REGISTER_BACKOFF_BASE * 2u32.pow(attempt))).await;
-                }
+                Delay::new(with_jitter(REGISTER_BACKOFF_BASE * 2u32.pow(attempt))).await;
             }
+            Err(e) => last_error = Some(e),
         }
     }
+    let last_error = last_error.map(|e| e.to_string()).unwrap_or_default();
     log::error!(
         "Giving up on registering worker {} (instance {instance}) after {REGISTER_ATTEMPTS} \
-         attempts; it will keep polling and the keep-alive stream will register it once the \
-         database is reachable",
+         attempts ({last_error}); it will keep polling and the keep-alive stream will register \
+         it once the database is reachable",
         worker.name()
     );
     Ok(None)
