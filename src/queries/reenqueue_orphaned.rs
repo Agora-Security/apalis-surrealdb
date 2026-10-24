@@ -94,7 +94,9 @@ pub async fn reenqueue_orphaned(
                 tx_unavailable_backoff("reenqueue_orphaned", attempt).await;
                 continue;
             }
-            Some(TxOutcome::Fail(err)) => return Err(SurrealError::Database(err)),
+            Some(TxOutcome::Fail(err) | TxOutcome::CommitFailed(err)) => {
+                return Err(SurrealError::Database(err));
+            }
             None => {}
         }
 

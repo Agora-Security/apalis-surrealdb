@@ -57,7 +57,9 @@ pub async fn kill_task(
                 last_err = Some(err);
                 tx_unavailable_backoff("kill_task", attempt).await;
             }
-            Some(TxOutcome::Fail(err)) => return Err(SurrealError::Database(err)),
+            Some(TxOutcome::Fail(err) | TxOutcome::CommitFailed(err)) => {
+                return Err(SurrealError::Database(err));
+            }
             None => return Ok(()),
         }
     }

@@ -63,7 +63,9 @@ pub async fn lock_task(
                 tx_unavailable_backoff("lock_task", attempt).await;
                 continue;
             }
-            Some(TxOutcome::Fail(err)) => return Err(SurrealError::Database(err)),
+            Some(TxOutcome::Fail(err) | TxOutcome::CommitFailed(err)) => {
+                return Err(SurrealError::Database(err));
+            }
             None => {}
         }
         let updated: Vec<Value> = response.take(0)?;

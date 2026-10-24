@@ -54,7 +54,9 @@ pub async fn fetch_next(
             Err(err) => return Err(SurrealError::Database(err)),
         };
         match classify_tx_errors(response.take_errors()) {
-            Some(TxOutcome::Retry(err)) => {
+            // a claim that failed to commit claimed nothing, and the `lock_by IS NONE` guard makes
+            // the replay safe even if another worker took the rows meanwhile
+            Some(TxOutcome::Retry(err) | TxOutcome::CommitFailed(err)) => {
                 last_err = Some(err);
                 tx_conflict_backoff("fetch_next", attempt).await;
                 continue;
